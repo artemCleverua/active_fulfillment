@@ -139,6 +139,29 @@ class RemoteShipwireTest < Minitest::Test
     assert_instance_of Hash, response.tracking_numbers # {"40298"=>["9400110200793596422990"]}
   end
 
+  def test_fetch_rate_data
+    options = {}
+    response = @shipwire.fetch_stock_levels
+    line_items = response.stock_levels.collect{|sku, q| {:sku => sku, :quantity => (q > 0) ? q : 1}}
+    response = @shipwire.fetch_rate_data('123456', @us_address, line_items, options)
+
+    assert response.success?
+    assert response.test?
+    assert_equal 3, response.params['quote'].count
+
+    response.params['quote'].each do |option_type, option|
+      assert ["GD", "2D","1D"].include?(option_type)
+      assert_equal 5, option.count
+      assert_equal 4, option['subtotal'].count
+      assert_equal 4, option['subtotal']['freight'].count
+      assert_equal 4, option['subtotal']['insurance'].count
+      assert_equal 4, option['subtotal']['packaging'].count
+      assert_equal 4, option['subtotal']['handling'].count
+      assert_equal 2, option['estimate'].count
+    end
+    assert_equal 'Successfully received the rate data', response.message
+  end
+
   def test_valid_credentials
     assert @shipwire.valid_credentials?
   end

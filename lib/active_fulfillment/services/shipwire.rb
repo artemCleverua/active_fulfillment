@@ -5,17 +5,20 @@ module ActiveFulfillment
 
     SERVICE_URLS = { :fulfillment  => 'https://api.shipwire.com/exec/FulfillmentServices.php',
                      :inventory    => 'https://api.shipwire.com/exec/InventoryServices.php',
-                     :tracking     => 'https://api.shipwire.com/exec/TrackingServices.php'
+                     :tracking     => 'https://api.shipwire.com/exec/TrackingServices.php',
+                     :rate         => 'https://api.shipwire.com/exec/RateServices.php'
                    }.freeze
 
     SCHEMA_URLS = { :fulfillment => 'http://www.shipwire.com/exec/download/OrderList.dtd',
                     :inventory   => 'http://www.shipwire.com/exec/download/InventoryUpdate.dtd',
-                    :tracking    => 'http://www.shipwire.com/exec/download/TrackingUpdate.dtd'
+                    :tracking    => 'http://www.shipwire.com/exec/download/TrackingUpdate.dtd',
+                    :rate        => 'http://www.shipwire.com/exec/download/RateRequest.dtd'
                   }.freeze
 
     POST_VARS = { :fulfillment => 'OrderListXML',
                   :inventory   => 'InventoryUpdateXML',
-                  :tracking    => 'TrackingUpdateXML'
+                  :tracking    => 'TrackingUpdateXML',
+                  :rate        => 'RateRequestXML'
                 }.freeze
 
     WAREHOUSES = { 'CHI' => 'Chicago',
@@ -61,6 +64,10 @@ module ActiveFulfillment
 
     def fetch_tracking_data(order_ids, options = {})
       commit :tracking, build_tracking_request(order_ids)
+    end
+
+    def fetch_rate_data(order_id, shipping_address, line_items, options = {})
+      commit :rate, build_rate_request(order_id, shipping_address, line_items, options)
     end
 
     def valid_credentials?
@@ -118,6 +125,17 @@ module ActiveFulfillment
       end
     end
 
+    def build_rate_request(order_id, shipping_address, line_items, options)
+      options[:rate] = true
+      xml = Builder::XmlMarkup.new :indent => 2
+      xml.instruct!
+      xml.declare! :DOCTYPE, :RateRequest, :SYSTEM, SCHEMA_URLS[:rate]
+      xml.tag! 'RateRequest' do
+        add_rate_credentials(xml)
+        add_order(xml, order_id, shipping_address, line_items, options)
+      end
+    end
+
     def add_credentials(xml)
       xml.tag! 'EmailAddress', @options[:login]
       xml.tag! 'Password', @options[:password]
@@ -125,12 +143,18 @@ module ActiveFulfillment
       xml.tag! 'AffiliateId', affiliate_id if affiliate_id.present?
     end
 
+    def add_rate_credentials(xml)
+      xml.tag! 'EmailAddress', @options[:login]
+      xml.tag! 'Password', @options[:password]
+      xml.tag! 'Server', 'Production'
+    end
+
     def add_order(xml, order_id, shipping_address, line_items, options)
       xml.tag! 'Order', :id => order_id do
         xml.tag! 'Warehouse', options[:warehouse] || '00'
 
         add_address(xml, shipping_address, options)
-        xml.tag! 'Shipping', options[:shipping_method] unless options[:shipping_method].blank?
+        xml.tag! 'Shipping', options[:shipping_method] unless (options[:shipping_method].blank? && options[:rate])
 
         Array(line_items).each_with_index do |line_item, index|
           add_item(xml, line_item, index)
@@ -143,22 +167,26 @@ module ActiveFulfillment
 
     def add_address(xml, address, options)
       xml.tag! 'AddressInfo', :type => 'Ship' do
-        xml.tag! 'Name' do
-          xml.tag! 'Full', address[:name]
+        if options[:rate].blank?
+          xml.tag! 'Name' do
+            xml.tag! 'Full', address[:name]
+          end
         end
 
         xml.tag! 'Address1', address[:address1]
         xml.tag! 'Address2', address[:address2]
 
-        xml.tag! 'Company', address[:company]
+        xml.tag! 'Company', address[:company] if options[:rate].blank?
 
         xml.tag! 'City', address[:city]
         xml.tag! 'State', address[:state] unless address[:state].blank?
         xml.tag! 'Country', address[:country]
 
         xml.tag! 'Zip', address[:zip]
-        xml.tag! 'Phone', address[:phone] unless address[:phone].blank?
-        xml.tag! 'Email', options[:email] unless options[:email].blank?
+        if options[:rate].blank?
+          xml.tag! 'Phone', address[:phone] unless address[:phone].blank?
+          xml.tag! 'Email', options[:email] unless options[:email].blank?
+        end
       end
     end
 
@@ -189,6 +217,8 @@ module ActiveFulfillment
         parse_inventory_response(data)
       when :tracking
         parse_tracking_response(data)
+      when :rate
+        parse_rate_response(data)
       else
         raise ArgumentError, "Unknown action #{action}"
       end
@@ -274,6 +304,78 @@ module ActiveFulfillment
 
       response[:success] = test? ? (response[:status] == '0'.freeze || response[:status] == 'Test'.freeze) : response[:status] == '0'.freeze
       response[:message] = response[:success] ? 'Successfully received the tracking numbers'.freeze : message_from(response[:error_message])
+      response
+    end
+
+    def parse_rate_response(xml)
+      response = {}
+      response[:quote] = {}
+      response[:warnings] = []
+
+      Parsing.with_xml_document(xml, response) do |document, response|
+        document.root.try do |root_document|
+          if root_document.xpath('//RateResponse'.freeze).blank?
+            response[root_document.name.underscore.to_sym] = node.text.strip
+          else
+            root_document.xpath('//RateResponse'.freeze).each do |node|
+              status = node.xpath('Status'.freeze).text.strip
+              response[:status] = status
+
+              node.xpath('Order'.freeze).each do |order|
+                order.xpath('Quotes'.freeze).each do |quotes|
+                  quotes.xpath('Quote'.freeze).each do |quote|
+                    quote_method = quote.attributes['method'.freeze].text
+                    response[:quote][quote_method] = {}
+
+                    quote_warehouse = quote.xpath('Warehouse').text.strip
+                    response[:quote][quote_method]['warehouse'] = quote_warehouse
+
+                    quote_service = quote.xpath('Service').text.strip
+                    response[:quote][quote_method]['service'] = quote_service
+
+                    cost = quote.xpath('Cost').first
+                    total_cost = cost.attributes['originalCost'].text.strip
+                    cost_currency = cost.attributes['currency'].text.strip
+
+                    response[:quote][quote_method]['cost'] = {
+                      'total' => total_cost,
+                      'currency' => cost_currency
+                    }
+
+                    response[:quote][quote_method]['subtotal'] = {}
+                    quote.xpath('Subtotals').each do |subtotals|
+                      subtotals.xpath('Subtotal'.freeze).each do |subtotal|
+                        sub_type = subtotal.attributes['type'].text.strip.downcase!
+                        original_cost = subtotal.xpath('Cost').first.attributes['originalCost'].text.strip
+                        response[:quote][quote_method]['subtotal'][sub_type] = original_cost
+                      end
+                    end
+
+                    estimate_time = quote.xpath('DeliveryEstimate').first
+                    estimate_min_day = estimate_time.xpath('Minimum').text.strip
+                    estimate_max_day = estimate_time.xpath('Maximum').text.strip
+
+                    response[:quote][quote_method]['estimate'] = {
+                      'min_day' => estimate_min_day,
+                      'max_day' => estimate_max_day
+                    }
+                  end
+                end
+
+                order.xpath('Warnings'.freeze).each do |warnings|
+                  warnings.xpath('Warning'.freeze).each do |warning|
+                    response[:warnings] << warning.text.strip
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+
+      response[:success] = response[:status] == 'OK'
+      response[:message] = response[:success] ? 'Successfully received the rate data' : message_from(response[:error_message])
+
       response
     end
 
